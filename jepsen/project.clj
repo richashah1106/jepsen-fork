@@ -22,9 +22,6 @@
                  [http-kit "2.8.0"]
                  [ring "1.13.0"]
                  [com.hierynomus/sshj "0.39.0"]
-                 [com.jcraft/jsch.agentproxy.connector-factory "0.0.9"]
-                 [com.jcraft/jsch.agentproxy.sshj "0.0.9"
-                  :exclusions [net.schmizz/sshj]]
                  [org.bouncycastle/bcprov-jdk15on "1.70"]
                  [hiccup "1.0.5"]
                  [metametadata/multiset "0.1.1"]
