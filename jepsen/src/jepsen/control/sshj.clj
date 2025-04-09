@@ -9,11 +9,7 @@
                             [retry :as retry]
                             [scp :as scp]]
             [slingshot.slingshot :refer [try+ throw+]])
-  (:import (com.jcraft.jsch.agentproxy AgentProxy
-                                       AgentProxyException
-                                       ConnectorFactory)
-           (com.jcraft.jsch.agentproxy.sshj AuthAgent)
-           (net.schmizz.sshj SSHClient)
+  (:import (net.schmizz.sshj SSHClient)
            (net.schmizz.sshj.common IOUtils
                                     Message
                                     SSHPacket)
@@ -30,19 +26,6 @@
            (java.util.concurrent Semaphore
                                  TimeUnit)))
 
-(defn ^Iterable auth-methods
-  "Returns a list of AuthMethods we can use for logging in via an AgentProxy."
-  [^AgentProxy agent]
-  (map (fn [identity]
-         (AuthAgent. agent identity))
-    (.getIdentities agent)))
-
-(defn ^AgentProxy agent-proxy
-  []
-  (-> (ConnectorFactory/getDefault)
-      .createConnector
-      AgentProxy.))
-
 (defn auth!
   "Tries a bunch of ways to authenticate an SSHClient. We start with the given
   key file, if provided, then fall back to general public keys, then fall back
@@ -53,17 +36,6 @@
         (.authPublickey c ^String username
                         ^"[Ljava.lang.String;" (into-array String [k]))
         true)
-
-      ; Try agent
-      (try
-        (let [agent-proxy (agent-proxy)
-              methods (auth-methods agent-proxy)]
-          (.auth c ^String username methods)
-          true)
-        (catch AgentProxyException e
-          false)
-        (catch UserAuthException e
-          false))
 
       ; Fall back to standard id_rsa/id_dsa keys
       (try (.authPublickey c ^String username)
