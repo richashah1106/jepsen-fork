@@ -64,19 +64,22 @@
          (map (partial str dir)))))
 
 (defn tmp-file!
-  "Creates a random, temporary file under tmp-dir-base, and returns its path."
-  []
-  (let [file (str tmp-dir-base "/" (rand-int Integer/MAX_VALUE))]
-    (if (exists? file)
-      (recur)
-      (do
-        (try+
-          (exec :touch file)
-          (catch [:exit 1] _
-            ; Parent dir might not exist
-            (exec :mkdir :-p tmp-dir-base)
-            (exec :touch file)))
-        file))))
+  "Creates a random, temporary file under tmp-dir-base, and returns its path.
+  Optionally takes an extension--default is \".tmp\""
+  ([]
+   (tmp-file! ".tmp"))
+  ([ext]
+   (let [file (str tmp-dir-base "/" (rand-int Integer/MAX_VALUE) ext)]
+     (if (exists? file)
+       (recur ext)
+       (do
+         (try+
+           (exec :touch file)
+           (catch [:exit 1] _
+             ; Parent dir might not exist
+             (exec :mkdir :-p tmp-dir-base)
+             (exec :touch file)))
+         file)))))
 
 (defn tmp-dir!
   "Creates a temporary directory under /tmp/jepsen and returns its path."
@@ -279,6 +282,33 @@
          ; Clean up tmpdir
          (exec :rm :-rf tmpdir))))
    dest))
+
+(defn tarball!
+  "Takes a path and creates a .tar.gz file of it, stored in a Jepsen temporary
+  directory. Returns the path to the tarball. Especially useful for tarring up
+  data directories on a DB node.
+
+  Ignores failed reads--these happen often when tarring up data and log files
+  from nodes that are crashing, and getting some data is better than crashing
+  the test."
+  [path]
+  (let [tarball          (tmp-file! ".tar.gz")
+        [match dir file] (re-find #"^(.+/)(.+)$" path)]
+    (try (if match
+           ; Only create one directory level deep
+           (cd dir
+               (exec :tar
+                     "czf" tarball
+                     "--ignore-failed-read"
+                     file))
+           (exec :tar
+                 "czf" tarball
+                 "--ignore-failed-read"
+                 path))
+         (catch RuntimeException e
+           (meh (exec :rm :f tarball))
+           (throw e)))
+    tarball))
 
 (defn ensure-user!
   "Make sure a user exists."

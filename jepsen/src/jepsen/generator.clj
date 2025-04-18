@@ -492,6 +492,42 @@
    (let [gen (java.util.Random. seed)]
      (repeatedly #(.nextDouble gen)))))
 
+(defn dissoc-vec
+  "Cut a single index out of a vector, returning a vector one shorter, without
+  the element at that index."
+  [v i]
+  (into (subvec v 0 i)
+        (subvec v (inc i))))
+
+(defn assoc-or-dissoc-vec
+  "Like (assoc v i x), but if `x` is nil, deletes that index from the vector
+  instead. Returns `nil` if the resulting vector would be empty. This is
+  particularly helpful for generators that have to track a vector of
+  sub-generators."
+  [v i x]
+  (if (nil? x)
+    ; Dissoc
+    (let [v' (dissoc-vec v i)]
+      (when (< 0 (count v'))
+        v'))
+    ; Assoc
+    (assoc v i x)))
+
+(defn update-all-
+  "Takes a vector of generators and updates them all with the given test,
+  context, and event. Returns the resulting vector, removing generators that
+  return `nil`. Returns `nil` if the vector would be empty."
+  [gens test ctx event]
+  (let [gens' (persistent!
+                (reduce (fn [gens' gen]
+                          (if-let [gen' (update gen test ctx event)]
+                            (conj! gens' gen')
+                            gens'))
+                        (transient [])
+                        gens))]
+    (when (seq gens')
+      gens')))
+
 ;; Generators!
 
 (defn tracking-get!
@@ -704,7 +740,8 @@
   "Validates the well-formedness of operations emitted from the underlying
   generator."
   [gen]
-  (Validate. gen))
+  (when gen
+    (Validate. gen)))
 
 (defrecord FriendlyExceptions [gen]
   Generator
@@ -746,7 +783,8 @@
   with a :type ::op-threw or ::update-threw Slingshot exception map, including
   the generator, context, and event which caused the exception."
   [gen]
-  (FriendlyExceptions. gen))
+  (when gen
+    (FriendlyExceptions. gen)))
 
 (defrecord Trace [k gen]
   Generator
@@ -791,33 +829,44 @@
   the underlying generator. Takes a key k, which is included in every log
   line."
   [k gen]
-  (Trace. k gen))
-
-(defrecord Map [f gen]
-  Generator
-  (op [_ test ctx]
-    (when-let [[op gen'] (op gen test ctx)]
-      [(if (= :pending op) op (f op))
-       (Map. f gen')]))
-
-  (update [_ test ctx event]
-    (Map. f (update gen test ctx event))))
+  (when gen
+    (Trace. k gen)))
 
 (defn concat
   "Where your generators are sequences, you can use Clojure's `concat` to make
   them a generator. This `concat` is useful when you're trying to concatenate
   arbitrary generators. Right now, (concat a b c) is simply '(a b c)."
   [& gens]
-  (seq gens))
+  (seq (remove nil? gens)))
+
+(defrecord Map [f ^long arity gen]
+  Generator
+  (op [_ test ctx]
+    (when-let [[op gen'] (op gen test ctx)]
+      [(if (= :pending op)
+         op
+         ; Transform op
+         (case arity
+           1 (f op)
+           3 (f op test ctx)))
+       (Map. f arity gen')]))
+
+  (update [_ test ctx event]
+    (Map. f arity (update gen test ctx event))))
 
 (defn map
   "A generator which wraps another generator g, transforming operations it
   generates with (f op). When the underlying generator yields :pending or nil,
   this generator does too, without calling `f`. Passes updates to underlying
-  generator."
+  generator.
+
+  f may optionally take additional arguments: `(f op test context)`."
   [f gen]
-  (when gen
-    (Map. f gen)))
+  (let [arity (reduce max 0 (util/arities (class f)))]
+    (assert (or (= 1 arity) (= 3 arity))
+            "`map` requires a function of one or three arguments")
+    (when gen
+      (Map. f arity gen))))
 
 (defn f-map
   "Takes a function `f-map` converting op functions (:f op) to other functions,
@@ -846,7 +895,8 @@
   on only those which match (f op). Like `map`, :pending and nil operations
   bypass the filter."
   [f gen]
-  (Filter. f gen))
+  (when gen
+    (Filter. f gen)))
 
 (defrecord IgnoreUpdates [gen]
   Generator
@@ -896,7 +946,8 @@
   generator: it will only include free threads and workers satisfying f.
   Updates are passed on only when the thread performing the update matches f."
   [f gen]
-  (OnThreads. f (context/make-thread-filter f) gen))
+  (when gen
+    (OnThreads. f (context/make-thread-filter f) gen)))
 
 (def on "For backwards compatibility" on-threads)
 
@@ -961,16 +1012,55 @@
       [op (Any. (assoc gens i gen'))]))
 
   (update [this test ctx event]
-    (Any. (mapv (fn updater [gen] (update gen test ctx event)) gens))))
+    (when-let [gens' (update-all- gens test ctx event)]
+      (Any. gens'))))
 
 (defn any
   "Takes multiple generators and binds them together. Operations are taken from
   any generator. Updates are propagated to all generators."
   [& gens]
-  (condp = (count gens)
+  (let [gens (vec (remove nil? gens))]
+    (case (count gens)
+      0 nil
+      1 (first gens)
+      (Any. (vec gens)))))
+
+(defrecord ShortestAny [gens]
+  Generator
+  (op [this test ctx]
+    (let [; Ask each generator for an op
+          candidates (->> gens
+                          (map-indexed
+                            (fn [i gen]
+                              (when-let [[op gen'] (op gen test ctx)]
+                                {:i i
+                                 :op op
+                                 :gen' gen'}))))]
+      (when (not-any? nil? candidates)
+        ; Everyone has an operation for us. Pick the soonest.
+        (let [{:keys [i op gen']} (reduce soonest-op-map nil candidates)]
+          ; If this generator is exhausted, we can terminate immediately.
+          [op (when gen' (ShortestAny. (assoc gens i gen')))]))))
+
+  (update [this test ctx event]
+    (when-let [gens' (update-all- gens test ctx event)]
+      (when (= (count gens') (count gens))
+        ; All generators are still here, we can keep going
+        (ShortestAny. gens')))))
+
+(defn shortest-any
+  "Like `any`, binds multiple generators into a single one. Operations are
+  taken from any generator, updates are propagated to all generators. As soon
+  as any generator is exhausted, this generator is too.
+
+  This is particularly helpful when you have a workload generator you'd like to
+  run while doing some sequence of nemesis operations, and stop as soon as the
+  nemesis is done."
+  [& gens]
+  (case (count gens)
     0 nil
     1 (first gens)
-      (Any. (vec gens))))
+    (ShortestAny. (vec gens))))
 
 (defn each-thread-ensure-context-filters!
   "Ensures an EachThread has context filters for each thread."
@@ -1033,7 +1123,8 @@
   its free process list. Updates are propagated to the generator for the thread
   which emitted the operation."
   [gen]
-  (EachThread. gen (promise) {}))
+  (when gen
+    (EachThread. gen (promise) {})))
 
 (defrecord EachProcess
   [; A fresh copy of the generator we start with for each process
@@ -1103,7 +1194,8 @@
   process in its free process list. Updates are propagated to the generator for
   the thread which emitted the operation."
   [gen]
-  (EachProcess. gen (promise) {} {}))
+  (when gen
+    (EachProcess. gen (promise) {} {})))
 
 (defrecord Reserve [ranges all-ranges context-filters gens]
   ; ranges is a collection of sets of threads engaged in each generator.
@@ -1225,13 +1317,6 @@
    (any (nemesis nemesis-gen)
         (clients client-gen))))
 
-(defn dissoc-vec
-  "Cut a single index out of a vector, returning a vector one shorter, without
-  the element at that index."
-  [v i]
-  (into (subvec v 0 i)
-        (subvec v (inc i))))
-
 (defrecord Mix [i gens]
   ; i is the next generator index we intend to work with; we reset it randomly
   ; when emitting ops.
@@ -1262,8 +1347,9 @@
   won't let other generators (which could help us get unstuck!) advance. We
   should probably cycle on :pending."
   [gens]
-  (when (seq gens)
-    (Mix. (rand-int (count gens)) (vec gens))))
+  (let [gens (vec (remove nil? gens))]
+    (when (seq gens)
+      (Mix. (rand-int (count gens)) gens))))
 
 (defrecord Limit [remaining gen]
   Generator
@@ -1279,7 +1365,8 @@
   "Wraps a generator and ensures that it returns at most `limit` operations.
   Propagates every update to the underlying generator."
   [remaining gen]
-  (Limit. remaining gen))
+  (when gen
+    (Limit. remaining gen)))
 
 (defn once
   "Emits only a single item from the underlying generator."
@@ -1314,10 +1401,12 @@
   operations, but `repeat` does *not* memoize its results; repeating a
   nondeterministic generator results in a sequence of *different* operations."
   ([gen]
-   (Repeat. -1 gen))
+   (when gen
+     (Repeat. -1 gen)))
   ([limit gen]
    (assert (not (neg? limit)))
-   (Repeat. limit gen)))
+   (when gen
+     (Repeat. limit gen))))
 
 (defrecord Cycle [remaining original-gen gen]
   Generator
@@ -1343,9 +1432,11 @@
   not affect the original. Not sure if this is the right call--might change
   that later."
   ([gen]
-   (Cycle. -1 gen gen))
+   (when gen
+     (Cycle. -1 gen gen)))
   ([limit gen]
-   (Cycle. limit gen gen)))
+   (when (and gen (pos? limit))
+     (Cycle. limit gen gen))))
 
 (defrecord ProcessLimit [n procs gen]
   Generator
@@ -1372,8 +1463,8 @@
   \"trickling\" at the end of a test, i.e. letting only one or two processes
   continue to perform ops, rather than the full concurrency of the test."
   [n gen]
-  (ProcessLimit. n #{} gen))
-
+  (when (and (pos? n) gen)
+    (ProcessLimit. n #{} gen)))
 
 (defrecord ConcurrencyLimit [n gen]
   Generator
@@ -1393,7 +1484,8 @@
   most n. This generator returns :pending whenever there are n or more threads
   busy."
   [n gen]
-  (ConcurrencyLimit. n gen))
+  (when (and gen (pos? n))
+    (ConcurrencyLimit. n gen)))
 
 (defrecord TimeLimit [limit cutoff gen]
   Generator
@@ -1419,7 +1511,8 @@
   operation (taken from that underlying generator), will only emit operations
   for dt seconds."
   [dt gen]
-  (TimeLimit. (long (util/secs->nanos dt)) nil gen))
+  (when (and gen (pos? dt))
+    (TimeLimit. (long (util/secs->nanos dt)) nil gen)))
 
 (defrecord Stagger [dt next-time gen]
   Generator
@@ -1457,8 +1550,9 @@
   stagger dt is 10, and your concurrency is 5, your new stagger dt should be
   2."
   [dt gen]
-  (let [dt (long (util/secs->nanos (* 2 dt)))]
-    (Stagger. dt nil gen)))
+  (when gen
+    (let [dt (long (util/secs->nanos (* 2 dt)))]
+      (Stagger. dt nil gen))))
 
 ; This isn't actually DelayTil. It spreads out *all* requests evenly. Feels
 ; like it might be useful later.
@@ -1553,8 +1647,14 @@
   "Takes several generators, and constructs a generator which evaluates
   everything from the first generator, then everything from the second, and so
   on."
-  [& generators]
-  (c/map synchronize generators))
+  [& gens]
+  (let [gens (->> gens
+                  (remove nil?)
+                  (c/map synchronize))]
+    (case (count gens)
+      0 nil
+      1 (first gens)
+      gens)))
 
 (defn then
   "Generator A, synchronize, then generator B. Note that this takes its
@@ -1565,7 +1665,9 @@
            (limit 3)
            (then (once {:f :read})))"
   [a b]
-  [b (synchronize a)])
+  (cond (nil? a)  b
+        (nil? b)  a
+        true      [b (synchronize a)]))
 
 (defrecord UntilOk [gen done? active-processes]
   Generator
@@ -1597,7 +1699,8 @@
   "Wraps a generator, yielding operations from it until one of those operations
   completes with :type :ok."
   [gen]
-  (UntilOk. gen false #{}))
+  (when gen
+    (UntilOk. gen false #{})))
 
 (defrecord FlipFlop [gens i]
   Generator
